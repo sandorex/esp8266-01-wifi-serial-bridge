@@ -7,7 +7,7 @@
 
 #define VERSION "1.0"
 
-#define SSID "ESP8266 WiFi Serial"
+#define SSID "ESP8266 Serial"
 #define SSID_CHANNEL 5
 #define SSID_HIDDEN false
 #define PSK "password" // NOTE change the password please
@@ -31,26 +31,29 @@ WiFiClient serverClient;
 // software serial for debugging
 EspSoftwareSerial::UART swSerial;
 
-long baudRate = 0;
+unsigned int setupProgress = 0;
 
 // has the communication started (used to setup the serial connection on power-on)
 bool started = false;
 
 void setup() {
     delay(500);
+
+    // i do not need receive pin here
     swSerial.begin(9600, EspSoftwareSerial::SWSERIAL_8N1, -1, 2, false);
     swSerial.enableRx(false);
     swSerial.enableTx(false);
 
-    Serial.begin(9600);
     Serial.setRxBufferSize(RXBUFFERSIZE);
 
-    swSerial.println("ESP8266 Wifi Telnet Serial Bridge");
+    swSerial.println("ESP8266 Wifi Serial Bridge");
     swSerial.println("Version: " VERSION);
+    swSerial.print("IP: ");
+    swSerial.println(local_ip);
 
     // limit to only one connection
     if (WiFi.softAP(ssid, password, SSID_CHANNEL, SSID_HIDDEN, 1) == true) {
-        swSerial.printf("Started WiFi AP '%s' with password '%s'\n", ssid, password);
+        swSerial.printf("Started WiFi AP '%s' with password '%s'\r\n", ssid, password);
     } else {
         swSerial.println("Could not start WiFi access point, restarting..");
         ESP.restart();
@@ -80,15 +83,16 @@ void loop() {
             // ask user to set baud rate
             if (!started) {
                 swSerial.println("Starting setup");
-                
-                // TODO reset options if not fully setup
+
+                // if not finished then reset the progress
+                setupProgress = 0;
             }
         } else {
             // hints: server.accept() is a WiFiClient with short-term scope
             // when out of scope, a WiFiClient will
             // - flush() - all data will be sent
             // - stop() - automatically too
-            server.accept().println("busy");
+            server.accept().println("Client already connected");
             swSerial.println("Client rejected");
         }
     }
@@ -131,7 +135,7 @@ void loop() {
             if (serverClient.availableForWrite() >= serial_got) {
                 size_t tcp_sent = serverClient.write(sbuf, serial_got);
                 if (tcp_sent != len) {
-                    swSerial.printf("len mismatch: available:%zd serial-read:%zd tcp-write:%zd\n", len, serial_got, tcp_sent);
+                    swSerial.printf("len mismatch: available:%zd serial-read:%zd tcp-write:%zd\r\n", len, serial_got, tcp_sent);
                 }
             }
         }
@@ -140,259 +144,137 @@ void loop() {
 
 void serialSetup() {
     String response = "";
+    bool hasResponded = false;
     // read input
     if (serverClient.available()) {
+        hasResponded = true;
         // 10 => LineFeed
         response = serverClient.readStringUntil(10);
 
-        swSerial.printf("Got '%s'\n", response.c_str());
+        swSerial.printf("Got '%s' (%d)\r\n", response.c_str(), response.length());
     }
 
-    if (baudRate == 0) {
-        // serverClient.write(
-        //     "Baud rates:\n"
-        //     " 4800\n"
-        //     " 9600*\n"
-        //     " 19200\n"
-        //     " 28800\n"
-        //     " 38400\n"
-        //     " 57600\n"
-        //     " 76800\n"
-        //     " 115200\n"
-        //     "\n"
-        // );
+    if (setupProgress == 0) {
+        serverClient.write(
+            "Baud rates:\n"
+            " 4800\n"
+            " 9600*\n"
+            " 19200\n"
+            " 28800\n"
+            " 38400\n"
+            " 57600\n"
+            " 76800\n"
+            " 115200\n"
+            "\n"
+            "Parity options:\n"
+            " 5N1 5E1 5O1\n"
+            " 6N1 6E1 6O1\n"
+            " 7N1 7E1 7O1\n"
+            " 5N2 5E2 5O2\n"
+            " 6N2 6E2 6O2\n"
+            " 7N2 7E2 7O2\n"
+            " 8N2 8E2 8O2\n"
+            " 8N1*\n"
+            "\n"
+            "Select config: "
+        );
 
+        ++setupProgress;
+    } else if (setupProgress == 1) {
         if (response.isEmpty()) {
+            if (hasResponded) {
+                // the default config
+                response = "9600-8N1";
+            } else {
+                return;
+            }
+        }
+
+        String baudRate = "";
+        size_t index = 0;
+        while (response.charAt(index) >= '0' && response.charAt(index) <= '9') {
+            baudRate += response.charAt(index++);
+        }
+
+        // there should be 4 more characters left  `*-8N1`
+        if (response.length() - index < 4) {
+            serverClient.printf("Invalid option '%s'\r\n", response.c_str());
+            --setupProgress;
             return;
         }
 
-        long baud = atol(response.c_str());
+        // skip dash
+        ++index;
+
+        long baud = atol(baudRate.c_str());
         if (baud == 0) {
-            swSerial.printf("Invalid baud rate '%s'", response.c_str());
+            swSerial.printf("Invalid baud rate '%s'\r\n", response.c_str());
+            --setupProgress;
             return;
         }
 
-        baudRate = baud;
-        swSerial.printf("Setting baud rate to %l", baudRate);
-    } else {
-        
+        String config = response.substring(index);
+        config.toUpperCase();
+
+        if (config == "5N1") {
+            Serial.begin(baud, SERIAL_5N1);
+        } else if (config == "6N1") {
+            Serial.begin(baud, SERIAL_6N1);
+        } else if (config == "7N1") {
+            Serial.begin(baud, SERIAL_7N1);
+        } else if (config == "5N2") {
+            Serial.begin(baud, SERIAL_5N2);
+        } else if (config == "6N2") {
+            Serial.begin(baud, SERIAL_6N2);
+        } else if (config == "7N2") {
+            Serial.begin(baud, SERIAL_7N2);
+        } else if (config == "8N2") {
+            Serial.begin(baud, SERIAL_8N2);
+        } else if (config == "5E1") {
+            Serial.begin(baud, SERIAL_5E1);
+        } else if (config == "6E1") {
+            Serial.begin(baud, SERIAL_6E1);
+        } else if (config == "7E1") {
+            Serial.begin(baud, SERIAL_7E1);
+        } else if (config == "8E1") {
+            Serial.begin(baud, SERIAL_8E1);
+        } else if (config == "5E2") {
+            Serial.begin(baud, SERIAL_5E2);
+        } else if (config == "6E2") {
+            Serial.begin(baud, SERIAL_6E2);
+        } else if (config == "7E2") {
+            Serial.begin(baud, SERIAL_7E2);
+        } else if (config == "8E2") {
+            Serial.begin(baud, SERIAL_8E2);
+        } else if (config == "5O1") {
+            Serial.begin(baud, SERIAL_5O1);
+        } else if (config == "6O1") {
+            Serial.begin(baud, SERIAL_6O1);
+        } else if (config == "7O1") {
+            Serial.begin(baud, SERIAL_7O1);
+        } else if (config == "8O1") {
+            Serial.begin(baud, SERIAL_8O1);
+        } else if (config == "5O2") {
+            Serial.begin(baud, SERIAL_5O2);
+        } else if (config == "6O2") {
+            Serial.begin(baud, SERIAL_6O2);
+        } else if (config == "7O2") {
+            Serial.begin(baud, SERIAL_7O2);
+        } else if (config == "8O2") {
+            Serial.begin(baud, SERIAL_8O2);
+        } else if (config == "8N1") {
+            Serial.begin(baud, SERIAL_8N1);
+        } else if (config == "8N2") {
+            Serial.begin(baud, SERIAL_8N2);
+        } else {
+            serverClient.printf("Invalid config '%s'\r\n", config.c_str());
+            swSerial.printf("Invalid config '%s'\r\n", config.c_str());
+            --setupProgress;
+            return;
+        }
+
+        swSerial.printf("Config baudrate=%ld config=%s\r\n", baud, config.c_str());
+        serverClient.printf("Config: baudrate=%ld config=%s\r\n", baud, config.c_str());
+        started = true;
     }
-    
-    // switch (setupProgress) {
-    //     case 1:
-    //         serverClient.write(
-    //             "Baud rates:\n"
-    //             " 4800\n"
-    //             " 9600*\n"
-    //             " 19200\n"
-    //             " 28800\n"
-    //             " 38400\n"
-    //             " 57600\n"
-    //             " 76800\n"
-    //             " 115200\n"
-    //             "\n"
-    //         );
-
-    //         ++setupProgress;
-    //         break;
-    //     case 2:
-    //         switch (response.c_str()) {
-    //             case "":
-    //                 break;
-    //         }
-
-            // String baudRate = "";
-            // String config = "";
-            // if (response.charAt(0) == (char)10) {
-            //     baudRate = "9600";
-            //     config = "8N1";
-            // } else {
-            //     size_t index = 0;
-            //     while (response.charAt(index) >= '0' && response.charAt(index) <= '9') {
-            //         baudRate += response.charAt(index);
-            //     }
-
-            //     // there should be 4 more characters left  `*-8N1`
-            //     if (response.length() - index < 4) {
-            //         serverClient.write("Invalid answer\n");
-            //         --setupProgress;
-            //         break;
-            //     }
-
-            //     // skip dash
-            //     ++index;
-
-            //     // if (response.length() <= index) {
-            //     //     serverClient.write("Invalid answer, missing config");
-            //     //     --setupProgress;
-            //     //     break;
-            //     // }
-
-            //     config = response.substring(index);
-            // }
-
-            // long baudRateLong = baudRate.toInt();
-
-            // swSerial.printf("Setting baudrate '%d', config '%s'\n", baudRateLong, config.c_str());
-
-    //         ++setupProgress;
-    //         break;
-    //     case 3:
-    //         serverClient.write(
-    //             "Baud rates:\n"
-    //             " 4800 9600\n"
-    //             " 19200 28800\n"
-    //             " 38400 57600\n"
-    //             " 76800 115200\n"
-    //             "\n"
-    //             "Configs:\n"
-    //             " 5N1 5E1 5O1\n"
-    //             " 6N1 6E1 6O1\n"
-    //             " 7N1 7E1 7O1\n"
-    //             " 5N2 5E2 5O2\n"
-    //             " 6N2 6E2 6O2\n"
-    //             " 7N2 7E2 7O2\n"
-    //             " 8N2 8E2 8O2\n"
-    //             " 8N1\n"
-    //             "\n"
-    //             "Default: 9600-8N1\n"
-    //         );
-
-    //         ++setupProgress;
-    //         break;
-    //     case 4:
-    //         break;
-    // }
-
-    // TODO ask questions repeadatly
-    // while (true) {
-        // serverClient.write("Common values:\n");
-        // serverClient.write("1) 4800\n");
-        // serverClient.write("2) 9600 (default)\n");
-        // serverClient.write("3) 19200\n");
-        // serverClient.write("4) 28800\n");
-        // serverClient.write("5) 38400\n");
-        // serverClient.write("6) 57600\n");
-        // serverClient.write("7) 76800\n");
-        // serverClient.write("8) 115200\n\n");
-        // serverClient.write("Select baud rate (enter for default): ");
-
-        // long baud = serverClient.parseInt();
-
-        // swSerial.printf("Setting baud rate to %l", baud);
-
-        // serverClient.readStringUntil('\r');
-
-        // switch (ans) {
-        //     case '1':
-        //         break;
-        //     case '2':
-        //         break;
-        //     case '3':
-        //         break;
-        //     case '4':
-        //         break;
-        //     case '5':
-        //         break;
-        //     case '6':
-        //         break;
-        //     case '7':
-        //         break;
-        //     case '8':
-        //         break;
-        //     case '':
-        //         break;
-        //     default:
-        //         break;
-        // }
-    // }
-
-    // switch (config) {
-    //     // no parity
-    //     case "5N1":
-    //         Serial.begin(baudRate, SERIAL_5N1);
-    //         break;
-    //     case "6N1":
-    //         Serial.begin(baudRate, SERIAL_6N1);
-    //         break;
-    //     case "7N1":
-    //         Serial.begin(baudRate, SERIAL_7N1);
-    //         break;
-    //     case "5N2":
-    //         Serial.begin(baudRate, SERIAL_5N2);
-    //         break;
-    //     case "6N2":
-    //         Serial.begin(baudRate, SERIAL_6N2);
-    //         break;
-    //     case "7N2":
-    //         Serial.begin(baudRate, SERIAL_7N2);
-    //         break;
-    //     case "8N2":
-    //         Serial.begin(baudRate, SERIAL_8N2);
-    //         break;
-
-    //     // even parity
-    //     case "5E1":
-    //         Serial.begin(baudRate, SERIAL_5E1);
-    //         break;
-    //     case "6E1":
-    //         Serial.begin(baudRate, SERIAL_6E1);
-    //         break;
-    //     case "7E1":
-    //         Serial.begin(baudRate, SERIAL_7E1);
-    //         break;
-    //     case "8E1":
-    //         Serial.begin(baudRate, SERIAL_8E1);
-    //         break;
-    //     case "5E2":
-    //         Serial.begin(baudRate, SERIAL_5E2);
-    //         break;
-    //     case "6E2":
-    //         Serial.begin(baudRate, SERIAL_6E2);
-    //         break;
-    //     case "7E2":
-    //         Serial.begin(baudRate, SERIAL_7E2);
-    //         break;
-    //     case "8E2":
-    //         Serial.begin(baudRate, SERIAL_8E2);
-    //         break;
-
-    //     // odd parity
-    //     case "5O1":
-    //         Serial.begin(baudRate, SERIAL_5O1);
-    //         break;
-    //     case "6O1":
-    //         Serial.begin(baudRate, SERIAL_6O1);
-    //         break;
-    //     case "7O1":
-    //         Serial.begin(baudRate, SERIAL_7O1);
-    //         break;
-    //     case "8O1":
-    //         Serial.begin(baudRate, SERIAL_8O1);
-    //         break;
-    //     case "5O2":
-    //         Serial.begin(baudRate, SERIAL_5O2);
-    //         break;
-    //     case "6O2":
-    //         Serial.begin(baudRate, SERIAL_6O2);
-    //         break;
-    //     case "7O2":
-    //         Serial.begin(baudRate, SERIAL_7O2);
-    //         break;
-    //     case "8O2":
-    //         Serial.begin(baudRate, SERIAL_8O2);
-    //         break;
-
-    //     // 8N1 is the default
-    //     case "":
-    //         Serial.begin(baudRate, SERIAL_8N1);
-    //         break;
-    
-    //     default: // TODO
-    //         break;
-    // }
-
-    // String s = serverClient.readStringUntil('\n');
-    // serverClient.write(s.c_str());
-    // Serial.updateBaudRate(9600);
 }
