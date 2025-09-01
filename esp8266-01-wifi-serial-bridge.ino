@@ -1,59 +1,112 @@
 #include <ESP8266WiFi.h>
 #include <WiFiClient.h>
-#include <ESP8266mDNS.h>
-#include <algorithm>  // std::min
 #include <SoftwareSerial.h>
 #include <stdlib.h>
+#include <EEPROM.h>
+#include <algorithm>  // std::min
 
-#define VERSION "1.0"
+#include "utils.hh"
 
-#define SSID "ESP8266 Serial"
-#define SSID_CHANNEL 5
-#define SSID_HIDDEN false
-#define PSK "password" // NOTE change the password please
+const uint16_t VERSION = 3;
+
+#define PORT_SETUP 20
+#define PORT_SERIAL 23
 
 #define RXBUFFERSIZE 1024
 #define STACK_PROTECTOR 512  // bytes
 
-const char *ssid = SSID;
-const char *password = PSK;
+#define NAME "ESP8266 Wifi Serial Bridge"
 
-const int port = 23;
+typedef struct {
+    uint8_t channel = 7;
+    char ssid[32] = "ESP8266 Serial";
+    char password[16] = "password";
+    SerialConfig config = SerialConfig::SERIAL_8N1;
+    bool hidden = false;
+    uint32_t baud = 9600;
+} settings_t;
+
+settings_t settings;
 
 // ip address of the device itself
 IPAddress local_ip(192, 168, 1, 1);
 IPAddress gateway(192, 168, 1, 1);
 IPAddress subnet(255, 255, 255, 0);
 
-WiFiServer server(port);
-WiFiClient serverClient;
+// socket to configure the device
+WiFiServer server_setup(PORT_SETUP);
+
+// socket to talk serial
+WiFiServer server_serial(PORT_SERIAL);
+
+// only one client can be connected
+WiFiClient client;
+
+// is the client in setup server or serial
+bool is_setup = false;
 
 // software serial for debugging
 EspSoftwareSerial::UART swSerial;
 
-unsigned int setupProgress = 0;
+typedef enum {
+    MENU_START_PRINT,
+    MENU_START,
 
-// has the communication started (used to setup the serial connection on power-on)
-bool started = false;
+    MENU_BAUD,
+    MENU_CONFIG,
+
+    MENU_WIFI_PRINT,
+    MENU_WIFI,
+    MENU_SSID,
+    MENU_PASSWORD,
+    MENU_CHANNEL
+} MenuIndex;
+
+MenuIndex menu_index = MENU_START_PRINT;
 
 void setup() {
-    delay(500);
-
     // i do not need receive pin here
     swSerial.begin(9600, EspSoftwareSerial::SWSERIAL_8N1, -1, 2, false);
     swSerial.enableRx(false);
     swSerial.enableTx(false);
 
+    delay(100);
+
+    swSerial.println(NAME);
+    swSerial.printf("Version: %d\r\n", VERSION);
+
+    EEPROM.begin(512);
+
+    {
+        uint16_t version;
+        EEPROM.get(0, version);
+
+        // only load the eeprom data if same version as the current program
+        if (version == VERSION) {
+            swSerial.println("Using settings from EEPROM");
+
+            EEPROM.get(sizeof(version), settings);
+        } else {
+            swSerial.printf("EEPROM settings version mismatch (%d != %d)\r\n", version, VERSION);
+        }
+    }
+
+    swSerial.print("Setup: ");
+    swSerial.print(local_ip);
+    swSerial.print(":");
+    swSerial.println(PORT_SETUP);
+
+    swSerial.print("Serial: ");
+    swSerial.print(local_ip);
+    swSerial.print(":");
+    swSerial.println(PORT_SERIAL);
+
+    Serial.begin(settings.baud, settings.config);
     Serial.setRxBufferSize(RXBUFFERSIZE);
 
-    swSerial.println("ESP8266 Wifi Serial Bridge");
-    swSerial.println("Version: " VERSION);
-    swSerial.print("IP: ");
-    swSerial.println(local_ip);
-
     // limit to only one connection
-    if (WiFi.softAP(ssid, password, SSID_CHANNEL, SSID_HIDDEN, 1) == true) {
-        swSerial.printf("Started WiFi AP '%s' with password '%s'\r\n", ssid, password);
+    if (WiFi.softAP(settings.ssid, settings.password, settings.channel, settings.hidden, 1) == true) {
+        swSerial.printf("Started WiFi AP '%s' with password '%s'\r\n", settings.ssid, settings.password);
     } else {
         swSerial.println("Could not start WiFi access point, restarting..");
         ESP.restart();
@@ -61,55 +114,74 @@ void setup() {
 
     WiFi.softAPConfig(local_ip, gateway, subnet);
 
-    if (!MDNS.begin("esp8266")) {
-        swSerial.println("Error setting up MDNS responder!");
-        while (1) { delay(1000); }
-    }
+    server_serial.begin();
+    server_serial.setNoDelay(true);
 
-    server.begin();
-    server.setNoDelay(true);
+    server_setup.begin();
+    server_setup.setNoDelay(true);
 
-    MDNS.addService("telnet", "tcp", port);
+    delay(500);
 }
 
 void loop() {
-    // accept new client only if there are none connected
-    if (server.hasClient()) {
-        if (!serverClient) {
-            serverClient = server.accept();
-
-            swSerial.println("New client connected");
-
-            // ask user to set baud rate
-            if (!started) {
-                swSerial.println("Starting setup");
-
-                // if not finished then reset the progress
-                setupProgress = 0;
-            }
-        } else {
-            // hints: server.accept() is a WiFiClient with short-term scope
-            // when out of scope, a WiFiClient will
-            // - flush() - all data will be sent
-            // - stop() - automatically too
-            server.accept().println("Client already connected");
-            swSerial.println("Client rejected");
+    // each new client just drops the old one
+    if (server_setup.hasClient()) {
+        if (client) {
+            client.stop();
         }
+
+        client = server_setup.accept();
+        is_setup = true;
+
+        client.println(NAME " Setup");
+        swSerial.println("New setup client connected");
+
+        menu_index = MENU_START_PRINT;
     }
 
-    if (!started) {
-        serialSetup();
+    if (server_serial.hasClient()) {
+        if (client) {
+            client.stop();
+        }
+
+        client = server_serial.accept();
+        is_setup = false;
+
+        client.println(NAME);
+        swSerial.println("New serial client connected");
+    }
+
+    // there is nothing to do without a client
+    if (!client) {
+        return;
+    }
+
+    if (is_setup) {
+        do_menu();
     } else {
-        while (serverClient.available() && Serial.availableForWrite() > 0) {
-            // working char by char is not very efficient
-            Serial.write(serverClient.read());
+        // NOTE: this is a simpler version of the below code
+        /*
+        // if there is any data from client send it to the serial
+        if (client.available() > 0 && Serial.availableForWrite() > 0) {
+            client.sendAvailable(Serial);
+        }
+
+        // if there is any data from serial send it to the client
+        if (Serial.available() > 0 && client.availableForWrite() > 0) {
+            Serial.sendAvailable(client);
+        }
+        */
+
+        // more complex code
+        while (client.available() > 0 && Serial.availableForWrite() > 0) {
+            Serial.write(client.read());
         }
 
         // determine maximum output size "fair TCP use"
         // client.availableForWrite() returns 0 when !client.connected()
         int maxToTcp = 0;
-        if (serverClient) {
-            int afw = serverClient.availableForWrite();
+        if (client) {
+            int afw = client.availableForWrite();
             if (afw) {
                 if (!maxToTcp) {
                     maxToTcp = afw;
@@ -132,8 +204,8 @@ void loop() {
             // if client.availableForWrite() was 0 (congested)
             // and increased since then,
             // ensure write space is sufficient:
-            if (serverClient.availableForWrite() >= serial_got) {
-                size_t tcp_sent = serverClient.write(sbuf, serial_got);
+            if (client.availableForWrite() >= serial_got) {
+                size_t tcp_sent = client.write(sbuf, serial_got);
                 if (tcp_sent != len) {
                     swSerial.printf("len mismatch: available:%zd serial-read:%zd tcp-write:%zd\r\n", len, serial_got, tcp_sent);
                 }
@@ -142,139 +214,241 @@ void loop() {
     }
 }
 
-void serialSetup() {
-    String response = "";
+void do_menu() {
+    String response;
     bool hasResponded = false;
-    // read input
-    if (serverClient.available()) {
-        hasResponded = true;
-        // 10 => LineFeed
-        response = serverClient.readStringUntil(10);
 
-        swSerial.printf("Got '%s' (%d)\r\n", response.c_str(), response.length());
+    // read 
+    int len = client.available();
+    if (len) {
+        char raw[64];
+        hasResponded = true;
+        const int raw_length = std::min(len, 64);
+        client.read(raw, raw_length);
+        raw[raw_length] = '\0';
+        response = raw;
+
+        // removes any whitespace including newline and linefeed
+        response.trim();
+        
+        client.printf("\r\n");
     }
 
-    if (setupProgress == 0) {
-        serverClient.write(
-            "Baud rates:\n"
-            " 4800\n"
-            " 9600*\n"
-            " 19200\n"
-            " 28800\n"
-            " 38400\n"
-            " 57600\n"
-            " 76800\n"
-            " 115200\n"
-            "\n"
-            "Parity options:\n"
-            " 5N1 5E1 5O1\n"
-            " 6N1 6E1 6O1\n"
-            " 7N1 7E1 7O1\n"
-            " 5N2 5E2 5O2\n"
-            " 6N2 6E2 6O2\n"
-            " 7N2 7E2 7O2\n"
-            " 8N2 8E2 8O2\n"
-            " 8N1*\n"
-            "\n"
-            "Select config: "
-        );
+    switch (menu_index) {
+        case MENU_START_PRINT:
+            client.printf("w) WiFi AP options\r\n");
+            client.printf("b) Serial baud rate (%d)\r\n", settings.baud);
+            client.printf("c) Serial config (%s)\r\n\n", serial_config_to_string(settings.config).value_or("???").c_str());
 
-        ++setupProgress;
-    } else if (setupProgress == 1) {
-        if (response.isEmpty()) {
-            if (hasResponded) {
-                // the default config
-                response = "9600-8N1";
-            } else {
+            client.printf("s) Save to EEPROM\r\n");
+            client.printf("d) Restore default settings\r\n");
+            client.printf("r) Reboot\r\n");
+            client.printf("p) Programming mode\r\n");
+            client.printf("q) Quit\r\n\n");
+            client.printf("Choose an option: ");
+
+            menu_index = MENU_START;
+            return;
+        case MENU_WIFI_PRINT:
+            client.printf("s) Set SSID ('%s')\r\n", settings.ssid);
+            client.printf("p) Set password ('%s')\r\n", settings.password);
+            client.printf("c) Set channel (%d)\r\n", settings.channel);
+            client.printf("h) Set hidden (%s)\r\n\n", settings.hidden ? "true" : "false");
+
+            client.printf("b) Go back\r\n\n");
+
+            client.printf("Choose an option: ");
+
+            menu_index = MENU_WIFI;
+            return;
+        default:
+            break;
+    }
+
+    // rest of the cases are for interactive stuff
+    if (!hasResponded) {
+        return;
+    }
+
+    switch (menu_index) {
+        case MENU_START:
+            if (response.isEmpty() || response.length() != 1) {
+                client.printf("Invalid option '%s'\r\n", response.c_str());
                 return;
             }
-        }
 
-        String baudRate = "";
-        size_t index = 0;
-        while (response.charAt(index) >= '0' && response.charAt(index) <= '9') {
-            baudRate += response.charAt(index++);
-        }
+            // dont care about case sensitivity
+            response.toLowerCase();
 
-        // there should be 4 more characters left  `*-8N1`
-        if (response.length() - index < 4) {
-            serverClient.printf("Invalid option '%s'\r\n", response.c_str());
-            --setupProgress;
-            return;
-        }
+            switch (response.charAt(0)) {
+                case 'w':
+                    menu_index = MENU_WIFI_PRINT;
+                    break;
+                case 'b':
+                    client.printf("Please enter baud rate: ");
+                    menu_index = MENU_BAUD;
+                    break;
+                case 'c':
+                    client.printf("Please enter serial config: ");
+                    menu_index = MENU_CONFIG;
+                    break;
+                case 's':
+                    client.printf("Saving to EEPROM..\r\n");
+                    EEPROM.put(0, VERSION);
+                    EEPROM.put(sizeof(VERSION), settings);
+                    EEPROM.commit();
 
-        // skip dash
-        ++index;
+                    menu_index = MENU_START_PRINT;
 
-        long baud = atol(baudRate.c_str());
-        if (baud == 0) {
-            swSerial.printf("Invalid baud rate '%s'\r\n", response.c_str());
-            --setupProgress;
-            return;
-        }
+                    break;
+                case 'd':
+                    client.printf("Restoring default settings..\r\n");
+                    {
+                        settings_t defaults;
+                        settings = defaults;
+                    }
+                    menu_index = MENU_START_PRINT;
+                    break;
+                case 'r':
+                    client.printf("Rebooting..\r\n");
+                    client.flush();
+                    ESP.restart();
+                    break;
+                case 'p':
+                    client.printf("Rebooting into prog mode..\r\n");
+                    client.flush();
+                    ESP.rebootIntoUartDownloadMode();
+                    break;
+                case 'q':
+                    client.printf("Disconnecting..\r\n");
+                    client.stop();
+                    break;
+                default:
+                    client.printf("Unknown option '%s'\r\n", response.c_str());
+                    break;
+            }
+            break;
+        case MENU_WIFI:
+            if (response.isEmpty() || response.length() != 1) {
+                client.printf("Invalid option '%s'\r\n", response.c_str());
+                return;
+            }
 
-        String config = response.substring(index);
-        config.toUpperCase();
+            // dont care about case sensitivity
+            response.toLowerCase();
 
-        if (config == "5N1") {
-            Serial.begin(baud, SERIAL_5N1);
-        } else if (config == "6N1") {
-            Serial.begin(baud, SERIAL_6N1);
-        } else if (config == "7N1") {
-            Serial.begin(baud, SERIAL_7N1);
-        } else if (config == "5N2") {
-            Serial.begin(baud, SERIAL_5N2);
-        } else if (config == "6N2") {
-            Serial.begin(baud, SERIAL_6N2);
-        } else if (config == "7N2") {
-            Serial.begin(baud, SERIAL_7N2);
-        } else if (config == "8N2") {
-            Serial.begin(baud, SERIAL_8N2);
-        } else if (config == "5E1") {
-            Serial.begin(baud, SERIAL_5E1);
-        } else if (config == "6E1") {
-            Serial.begin(baud, SERIAL_6E1);
-        } else if (config == "7E1") {
-            Serial.begin(baud, SERIAL_7E1);
-        } else if (config == "8E1") {
-            Serial.begin(baud, SERIAL_8E1);
-        } else if (config == "5E2") {
-            Serial.begin(baud, SERIAL_5E2);
-        } else if (config == "6E2") {
-            Serial.begin(baud, SERIAL_6E2);
-        } else if (config == "7E2") {
-            Serial.begin(baud, SERIAL_7E2);
-        } else if (config == "8E2") {
-            Serial.begin(baud, SERIAL_8E2);
-        } else if (config == "5O1") {
-            Serial.begin(baud, SERIAL_5O1);
-        } else if (config == "6O1") {
-            Serial.begin(baud, SERIAL_6O1);
-        } else if (config == "7O1") {
-            Serial.begin(baud, SERIAL_7O1);
-        } else if (config == "8O1") {
-            Serial.begin(baud, SERIAL_8O1);
-        } else if (config == "5O2") {
-            Serial.begin(baud, SERIAL_5O2);
-        } else if (config == "6O2") {
-            Serial.begin(baud, SERIAL_6O2);
-        } else if (config == "7O2") {
-            Serial.begin(baud, SERIAL_7O2);
-        } else if (config == "8O2") {
-            Serial.begin(baud, SERIAL_8O2);
-        } else if (config == "8N1") {
-            Serial.begin(baud, SERIAL_8N1);
-        } else if (config == "8N2") {
-            Serial.begin(baud, SERIAL_8N2);
-        } else {
-            serverClient.printf("Invalid config '%s'\r\n", config.c_str());
-            swSerial.printf("Invalid config '%s'\r\n", config.c_str());
-            --setupProgress;
-            return;
-        }
+            switch (response.charAt(0)) {
+                case 's':
+                    client.printf("Please enter WiFi SSID: ");
+                    menu_index = MENU_SSID;
+                    break;
+                case 'p':
+                    client.printf("Please enter WiFi password: ");
+                    menu_index = MENU_PASSWORD;
+                    break;
+                case 'c':
+                    client.printf("Please enter WiFi channel (1-13): ");
+                    menu_index = MENU_CHANNEL;
+                    break;
+                case 'h':
+                    settings.hidden = !settings.hidden;
+                    menu_index = MENU_WIFI_PRINT;
+                    break;
+                case 'b':
+                    menu_index = MENU_START_PRINT;
+                    break;
+                default:
+                    client.printf("Unknown option '%s'\r\n", response.c_str());
+                    break;
+            }
 
-        swSerial.printf("Config baudrate=%ld config=%s\r\n", baud, config.c_str());
-        serverClient.printf("Config: baudrate=%ld config=%s\r\n", baud, config.c_str());
-        started = true;
+            break;
+        case MENU_BAUD:
+            {
+                const long baud = atol(response.c_str());
+                if (baud == 0 || baud < 0) {
+                    client.printf("Invalid baud rate '%s'\r\n", response.c_str());
+                    return;
+                }
+
+                settings.baud = baud;
+
+                // serial does not need to be restarted for changes in baud rate
+                Serial.updateBaudRate(baud);
+                delay(500);
+            }
+
+            menu_index = MENU_START_PRINT;
+
+            break;
+        case MENU_CONFIG:
+            response.toLowerCase();
+
+            {
+                const auto config = parse_serial_config(response);
+                if (!config.has_value()) {
+                    client.printf("Invalid serial config '%s'\r\n", response.c_str());
+                    return;
+                }
+
+                settings.config = config.value();
+
+                // restart serial with new settings
+                Serial.flush();
+                Serial.end();
+                Serial.begin(settings.baud, settings.config);
+                delay(500);
+            }
+
+            menu_index = MENU_START_PRINT;
+            break;
+        case MENU_SSID:
+            if (response.isEmpty()) {
+                client.printf("SSID cannot be empty\r\n");
+                return;
+            }
+
+            strncpy(settings.ssid, response.c_str(), sizeof(settings.ssid));
+
+            // make sure it has a null character
+            settings.ssid[sizeof(settings.ssid) - 1] = '\0';
+
+            menu_index = MENU_WIFI_PRINT;
+            break;
+        case MENU_PASSWORD:
+            if (response.isEmpty()) {
+                client.printf("Password cannot be empty\r\n");
+                return;
+            }
+
+            strncpy(settings.password, response.c_str(), sizeof(settings.password));
+
+            // make sure it has a null character
+            settings.ssid[sizeof(settings.password) - 1] = '\0';
+
+            menu_index = MENU_WIFI_PRINT;
+            break;
+        case MENU_CHANNEL:
+            if (response.isEmpty()) {
+                client.printf("Channel cannot be empty\r\n");
+                return;
+            }
+
+            {
+                int channel = atoi(response.c_str());
+
+                // channels 1 - 13 are valid
+                if (channel > 0 && channel <= 13) {
+                    settings.channel = channel;
+                } else {
+                    client.printf("Invalid channel '%s'", response.c_str());
+                    return;
+                }
+            }
+
+            menu_index = MENU_WIFI_PRINT;
+            break;
+        default:
+            break;
     }
 }
