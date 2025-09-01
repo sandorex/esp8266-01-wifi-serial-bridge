@@ -1,11 +1,12 @@
 #include <ESP8266WiFi.h>
 #include <WiFiClient.h>
-#include <algorithm>  // std::min
 #include <SoftwareSerial.h>
 #include <stdlib.h>
 #include <EEPROM.h>
+#include <algorithm>  // std::min
 
-// NOTE this has to be size of one byte!
+#include "utils.hh"
+
 #define VERSION 3
 
 #define PORT_SETUP 20
@@ -14,11 +15,15 @@
 #define RXBUFFERSIZE 1024
 #define STACK_PROTECTOR 512  // bytes
 
+#define SSID_MAX 32
+#define PASSWORD_MAX 16
+
 typedef struct {
+    uint16_t version = VERSION;
     uint8_t channel = 7;
-    char ssid[32] = "ESP8266 Serial";
-    char password[16] = "password";
-    char parity[4] = "8N1";
+    char ssid[SSID_MAX] = "ESP8266 Serial";
+    char password[PASSWORD_MAX] = "password";
+    SerialConfig config = SerialConfig::SERIAL_8N1;
     bool hidden = false;
     uint32_t baud = 9600;
 } settings_t;
@@ -48,17 +53,15 @@ EspSoftwareSerial::UART swSerial;
 typedef enum {
     MENU_START_PRINT,
     MENU_START,
-    MENU_RESET,
 
     MENU_BAUD,
-    MENU_PARITY,
+    MENU_CONFIG,
 
     MENU_WIFI_PRINT,
     MENU_WIFI,
     MENU_SSID,
     MENU_PASSWORD,
-    MENU_CHANNEL,
-    MENU_HIDDEN
+    MENU_CHANNEL
 } MenuIndex;
 
 MenuIndex menu_index = MENU_START_PRINT;
@@ -66,16 +69,6 @@ MenuIndex menu_index = MENU_START_PRINT;
 void setup() {
     delay(500);
 
-    EEPROM.begin(512);
-
-    // only load the eeprom data if same version as the current program
-    uint8_t version;
-    EEPROM.get(0, version);
-    if (version == VERSION) {
-        EEPROM.get(1, settings);
-    }
-
-    // TODO use from eeprom
     Serial.begin(9600);
     Serial.setRxBufferSize(RXBUFFERSIZE);
 
@@ -86,6 +79,19 @@ void setup() {
 
     swSerial.println("ESP8266 Wifi Serial Bridge");
     swSerial.printf("Version: %d", VERSION);
+
+    EEPROM.begin(512);
+
+    // only load the eeprom data if same version as the current program
+    settings_t eeprom_settings;
+    EEPROM.get(0, settings);
+
+    if (settings.version == VERSION) {
+        swSerial.println("Using settings from EEPROM");
+        settings = eeprom_settings;
+    } else {
+        swSerial.printf("EEPROM settings version mismatch (%d != %d)", settings.version, VERSION);
+    }
 
     swSerial.print("Setup: ");
     swSerial.print(local_ip);
@@ -148,7 +154,6 @@ void loop() {
             do_menu();
         } else {
             while (client.available() && Serial.availableForWrite() > 0) {
-                // working char by char is not very efficient
                 Serial.write(client.read());
             }
 
@@ -209,10 +214,12 @@ void do_menu() {
         case MENU_START_PRINT:
             client.printf("w) WiFi AP options\r\n");
             client.printf("b) Set baud rate (%d)\r\n", settings.baud);
-            client.printf("p) Parity (%s)\r\n\n", settings.parity);
+            client.printf("c) Config (%s)\r\n\n", serial_config_to_string(settings.config).value_or("???").c_str());
 
             client.printf("s) Save to EEPROM\r\n");
-            client.printf("r) Reset to defaults\r\n\n");
+            client.printf("d) Restore default settings\r\n");
+            client.printf("r) Reboot\r\n");
+            client.printf("p) Reboot into programming mode\r\n\n");
             client.printf("Choose an option: ");
 
             menu_index = MENU_START;
@@ -223,7 +230,50 @@ void do_menu() {
                 return;
             }
 
-            do_menu_start(response);
+            if (response.isEmpty() || response.length() != 1) {
+                client.printf("Invalid option '%s'\r\n", response.c_str());
+                return;
+            }
+
+            // dont care about case sensitivity
+            response.toLowerCase();
+
+            switch (response.charAt(0)) {
+                case 'w':
+                    menu_index = MENU_WIFI;
+                    break;
+                case 'b':
+                    client.printf("Please enter baud rate: ");
+                    menu_index = MENU_BAUD;
+                    break;
+                case 'c':
+                    client.printf("Please enter serial config: ");
+                    menu_index = MENU_CONFIG;
+                    break;
+                case 's':
+                    client.printf("Saving to EEPROM..\r\n");
+                    EEPROM.put(0, settings);
+                    break;
+                case 'd':
+                    client.printf("Restoring default settings..\r\n");
+                    {
+                        settings_t defaults;
+                        settings = defaults;
+                    }
+                    menu_index = MENU_START_PRINT;
+                    break;
+                case 'r':
+                    client.printf("Rebooting..\r\n");
+                    ESP.restart();
+                    break;
+                case 'p':
+                    client.printf("Rebooting into prog mode..\r\n");
+                    ESP.rebootIntoUartDownloadMode();
+                    break;
+                default:
+                    client.printf("Unknown option '%s'\r\n", response.c_str());
+                    break;
+            }
             break;
         case MENU_WIFI_PRINT:
             client.printf("s) Set SSID ('%s')\r\n", settings.ssid);
@@ -243,27 +293,36 @@ void do_menu() {
                 return;
             }
 
-            do_menu_wifi(response);
-            break;
-        case MENU_RESET:
-            // wait for response
-            if (!hasResponded) {
+            if (response.isEmpty() || response.length() != 1) {
+                client.printf("Invalid option '%s'\r\n", response.c_str());
                 return;
             }
 
-            if (response == "y" || response == "Y") {
-                client.printf("Resetting to default values\r\n");
+            // dont care about case sensitivity
+            response.toLowerCase();
 
-                settings_t defaults;
-                EEPROM.put(0, VERSION);
-                EEPROM.put(1, defaults);
-
-                client.printf("Restarting\r\n");
-                ESP.restart();
-            } else {
-                client.printf("Cancelled\r\n");
-                menu_index = MENU_START_PRINT;
+            switch (response.charAt(0)) {
+                case 's':
+                    menu_index = MENU_SSID;
+                    break;
+                case 'p':
+                    menu_index = MENU_PASSWORD;
+                    break;
+                case 'c':
+                    menu_index = MENU_CHANNEL;
+                    break;
+                case 'h':
+                    settings.hidden = !settings.hidden;
+                    menu_index = MENU_WIFI_PRINT;
+                    break;
+                case 'b':
+                    menu_index = MENU_START_PRINT;
+                    break;
+                default:
+                    client.printf("Unknown option '%s'\r\n", response.c_str());
+                    break;
             }
+
             break;
         case MENU_BAUD:
             // wait for response
@@ -271,156 +330,82 @@ void do_menu() {
                 return;
             }
 
-            const long x = atol(response.c_str());
-            if (x == 0 || x < 0) {
-                client.printf("Invalid baud rate '%s'", response.c_str());
-                return;
-            }
+            {
+                const long baud = atol(response.c_str());
+                if (baud == 0 || baud < 0) {
+                    client.printf("Invalid baud rate '%s'\r\n", response.c_str());
+                    return;
+                }
 
-            settings.baud = x;
-            Serial.updateBaudRate(x);
+                settings.baud = baud;
+
+                // serial does not need to be restarted for changes in baud rate
+                Serial.updateBaudRate(baud);
+            }
 
             menu_index = MENU_WIFI_PRINT;
 
             break;
-        case MENU_PARITY:
+        case MENU_CONFIG:
             // wait for response
             if (!hasResponded) {
                 return;
             }
 
+            response.toLowerCase();
+
+            {
+                const auto config = parse_serial_config(response);
+                if (!config.has_value()) {
+                    client.printf("Invalid serial config '%s'\r\n", response.c_str());
+                    return;
+                }
+
+                settings.config = config.value();
+
+                // restart serial with new settings
+                Serial.flush();
+                Serial.end();
+                Serial.begin(settings.baud, settings.config);
+            }
+
             menu_index = MENU_WIFI_PRINT;
+            break;
+        case MENU_SSID:
+            // wait for response
+            if (!hasResponded) {
+                return;
+            }
 
+            if (response.isEmpty()) {
+                client.printf("SSID cannot be empty\r\n");
+                return;
+            }
+
+            strncpy(settings.ssid, response.c_str(), sizeof(settings.ssid));
+
+            // make sure it has a null character
+            settings.ssid[SSID_MAX - 1] = '\0';
+
+            menu_index = MENU_WIFI_PRINT;
+            break;
+        case MENU_PASSWORD:
+            // wait for response
+            if (!hasResponded) {
+                return;
+            }
+
+            if (response.isEmpty()) {
+                client.printf("Password cannot be empty\r\n");
+                return;
+            }
+
+            strncpy(settings.password, response.c_str(), sizeof(settings.ssid));
+
+            // make sure it has a null character
+            settings.ssid[PASSWORD_MAX - 1] = '\0';
+
+            menu_index = MENU_WIFI_PRINT;
             break;
     }
 }
-
-void do_menu_start(String& response) {
-    if (response.isEmpty() || response.length() != 1) {
-        client.printf("Invalid option '%s'\r\n", response.c_str());
-        return;
-    }
-
-    // dont care about case sensitivity
-    response.toLowerCase();
-
-    switch (response.charAt(0)) {
-        case 'w':
-            menu_index = MENU_WIFI;
-            return;
-        case 'b':
-            client.printf("Please enter baud rate: ");
-            menu_index = MENU_BAUD;
-            break;
-        case 'p':
-            client.printf("parity..\r\n");
-            menu_index = MENU_PARITY;
-            break;
-        case 's':
-            client.printf("Saving to EEPROM..\r\n");
-            EEPROM.put(0, VERSION);
-            EEPROM.put(1, settings);
-            break;
-        case 'r':
-            client.printf("This will reset all settings and restart the device, do you wish to proceed ? (y/n)");
-            menu_index = MENU_RESET;
-            break;
-        default:
-            client.printf("Unknown option '%s'\r\n", response.c_str());
-            break;
-    }
-}
-
-void do_menu_wifi(String& response) {
-    if (response.isEmpty() || response.length() != 1) {
-        client.printf("Invalid option '%s'\r\n", response.c_str());
-        return;
-    }
-
-    // dont care about case sensitivity
-    response.toLowerCase();
-
-    switch (response.charAt(0)) {
-        case 's':
-            client.printf("wifi..\r\n");
-            break;
-        case 'p':
-            client.printf("baud rate..\r\n");
-            break;
-        case 'c':
-            client.printf("parity..\r\n");
-            break;
-        case 'h':
-            client.printf("quitting..\r\n");
-            break;
-        case 'b':
-            menu_index = MENU_START_PRINT;
-            break;
-        default:
-            client.printf("Unknown option '%s'\r\n", response.c_str());
-            break;
-    }
-}
-
-bool is_valid_parity(char* config) {
-    // TODO
-    return false;
-}
-
-// bool serial_begin(unsigned long baud, char* config) {
-//     if (config == "5N1") {
-//         Serial.begin(baud, SERIAL_5N1);
-//     } else if (config == "6N1") {
-//         Serial.begin(baud, SERIAL_6N1);
-//     } else if (config == "7N1") {
-//         Serial.begin(baud, SERIAL_7N1);
-//     } else if (config == "5N2") {
-//         Serial.begin(baud, SERIAL_5N2);
-//     } else if (config == "6N2") {
-//         Serial.begin(baud, SERIAL_6N2);
-//     } else if (config == "7N2") {
-//         Serial.begin(baud, SERIAL_7N2);
-//     } else if (config == "8N2") {
-//         Serial.begin(baud, SERIAL_8N2);
-//     } else if (config == "5E1") {
-//         Serial.begin(baud, SERIAL_5E1);
-//     } else if (config == "6E1") {
-//         Serial.begin(baud, SERIAL_6E1);
-//     } else if (config == "7E1") {
-//         Serial.begin(baud, SERIAL_7E1);
-//     } else if (config == "8E1") {
-//         Serial.begin(baud, SERIAL_8E1);
-//     } else if (config == "5E2") {
-//         Serial.begin(baud, SERIAL_5E2);
-//     } else if (config == "6E2") {
-//         Serial.begin(baud, SERIAL_6E2);
-//     } else if (config == "7E2") {
-//         Serial.begin(baud, SERIAL_7E2);
-//     } else if (config == "8E2") {
-//         Serial.begin(baud, SERIAL_8E2);
-//     } else if (config == "5O1") {
-//         Serial.begin(baud, SERIAL_5O1);
-//     } else if (config == "6O1") {
-//         Serial.begin(baud, SERIAL_6O1);
-//     } else if (config == "7O1") {
-//         Serial.begin(baud, SERIAL_7O1);
-//     } else if (config == "8O1") {
-//         Serial.begin(baud, SERIAL_8O1);
-//     } else if (config == "5O2") {
-//         Serial.begin(baud, SERIAL_5O2);
-//     } else if (config == "6O2") {
-//         Serial.begin(baud, SERIAL_6O2);
-//     } else if (config == "7O2") {
-//         Serial.begin(baud, SERIAL_7O2);
-//     } else if (config == "8O2") {
-//         Serial.begin(baud, SERIAL_8O2);
-//     } else if (config == "8N1") {
-//         Serial.begin(baud, SERIAL_8N1);
-//     } else if (config == "8N2") {
-//         Serial.begin(baud, SERIAL_8N2);
-//     } else {
-//         return false;
-//     }
-
-//     return true;
-// }
