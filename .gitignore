@@ -1,3 +1,13 @@
 .pio/
 .cache/
 compile_commands.json
+
+# platformio generated qtcreator files
+Makefile
+platformio.cflags
+platformio.config
+platformio.files
+platformio.creator
+platformio.creator.user
+platformio.cxxflags
+platformio.includes

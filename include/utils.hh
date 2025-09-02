@@ -1,3 +1,5 @@
+#include <Arduino.h>
+
 std::optional<SerialConfig> parse_serial_config(String config) {
     if (config == "5N1") {
         return SERIAL_5N1;

@@ -8,8 +8,6 @@
 
 #include "utils.hh"
 
-const uint16_t VERSION = 3;
-
 #define PORT_SETUP 20
 #define PORT_SERIAL 23
 
@@ -17,6 +15,9 @@ const uint16_t VERSION = 3;
 #define STACK_PROTECTOR 512  // bytes
 
 #define NAME "ESP8266 Wifi Serial Bridge"
+
+// used to prevent loading incompatible settings struct
+const uint16_t VERSION = 3;
 
 typedef struct {
     uint8_t channel = 7;
@@ -222,9 +223,10 @@ void do_menu() {
     String response;
     bool hasResponded = false;
 
-    // read
+    // read input
     int len = client.available();
     if (len) {
+        // TODO this is a mess
         char raw[64];
         hasResponded = true;
         const int raw_length = std::min(len, 64);
