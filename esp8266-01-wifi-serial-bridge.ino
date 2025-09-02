@@ -65,26 +65,23 @@ typedef enum {
 MenuIndex menu_index = MENU_START_PRINT;
 
 void setup() {
-    Serial.begin(settings.baud, settings.config);
-    Serial.setRxBufferSize(RXBUFFERSIZE);
-
     // i do not need receive pin here
     swSerial.begin(9600, EspSoftwareSerial::SWSERIAL_8N1, -1, 2, false);
     swSerial.enableRx(false);
     swSerial.enableTx(false);
 
-    delay(500);
+    delay(100);
 
     swSerial.println(NAME);
     swSerial.printf("Version: %d\r\n", VERSION);
 
     EEPROM.begin(512);
 
-    // only load the eeprom data if same version as the current program
     {
         uint16_t version;
         EEPROM.get(0, version);
 
+        // only load the eeprom data if same version as the current program
         if (version == VERSION) {
             swSerial.println("Using settings from EEPROM");
 
@@ -104,6 +101,9 @@ void setup() {
     swSerial.print(":");
     swSerial.println(PORT_SERIAL);
 
+    Serial.begin(settings.baud, settings.config);
+    Serial.setRxBufferSize(RXBUFFERSIZE);
+
     // limit to only one connection
     if (WiFi.softAP(settings.ssid, settings.password, settings.channel, settings.hidden, 1) == true) {
         swSerial.printf("Started WiFi AP '%s' with password '%s'\r\n", settings.ssid, settings.password);
@@ -113,7 +113,6 @@ void setup() {
     }
 
     WiFi.softAPConfig(local_ip, gateway, subnet);
-    delay(500);
 
     server_serial.begin();
     server_serial.setNoDelay(true);
@@ -298,6 +297,8 @@ void do_menu() {
                     EEPROM.put(0, VERSION);
                     EEPROM.put(sizeof(VERSION), settings);
                     EEPROM.commit();
+
+                    menu_index = MENU_START_PRINT;
 
                     break;
                 case 'd':
