@@ -148,14 +148,33 @@ void loop() {
         client = server_serial.accept();
         is_setup = false;
 
-        client.println("ESP8266 Wifi Serial Bridge");
+        client.println(NAME);
         swSerial.println("New serial client connected");
+    }
+
+    // there is nothing to do without a client
+    if (!client) {
+        return;
     }
 
     if (is_setup) {
         do_menu();
-    } else if (client.available()) {
-        while (client.available() && Serial.availableForWrite() > 0) {
+    } else {
+        // NOTE: this is a simpler version of the below code
+        /*
+        // if there is any data from client send it to the serial
+        if (client.available() > 0 && Serial.availableForWrite() > 0) {
+            client.sendAvailable(Serial);
+        }
+
+        // if there is any data from serial send it to the client
+        if (Serial.available() > 0 && client.availableForWrite() > 0) {
+            Serial.sendAvailable(client);
+        }
+        */
+
+        // more complex code
+        while (client.available() > 0 && Serial.availableForWrite() > 0) {
             Serial.write(client.read());
         }
 
