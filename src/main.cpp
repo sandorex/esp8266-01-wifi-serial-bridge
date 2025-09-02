@@ -1,8 +1,9 @@
+#include <Arduino.h>
 #include <ESP8266WiFi.h>
 #include <WiFiClient.h>
 #include <SoftwareSerial.h>
-#include <stdlib.h>
 #include <EEPROM.h>
+#include <stdlib.h>
 #include <algorithm>  // std::min
 
 #include "utils.hh"
@@ -123,6 +124,9 @@ void setup() {
     delay(500);
 }
 
+// TODO temp
+void do_menu();
+
 void loop() {
     // each new client just drops the old one
     if (server_setup.hasClient()) {
@@ -218,7 +222,7 @@ void do_menu() {
     String response;
     bool hasResponded = false;
 
-    // read 
+    // read
     int len = client.available();
     if (len) {
         char raw[64];
@@ -230,7 +234,7 @@ void do_menu() {
 
         // removes any whitespace including newline and linefeed
         response.trim();
-        
+
         client.printf("\r\n");
     }
 

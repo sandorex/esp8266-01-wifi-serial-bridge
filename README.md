@@ -32,7 +32,7 @@ Hello
 ## WiFi Terminal
 Whole goal for this project was to be able to fix/configure headless machines without use of wifi or network
 
-> **NOTE:** You can set `export TERM=xterm-256color` so you get proper terminal experience
+> **NOTE:** You can set `export TERM=xterm-256color` so you get proper terminal experience\
 > **NOTE:** Run `eval $(resize)` when you resize the terminal
 
 1. Wire up ESP to a USB to serial adapter (like `CH340` for example) (**use a proper power supply for the ESP!**)
