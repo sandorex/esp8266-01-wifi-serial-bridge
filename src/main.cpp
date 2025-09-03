@@ -11,14 +11,15 @@
 #define PORT_SETUP 20
 #define PORT_SERIAL 23
 
+#define NAME "ESP8266 Wifi Serial Bridge"
+
 #define RXBUFFERSIZE 1024
 #define STACK_PROTECTOR 512  // bytes
 
-#define NAME "ESP8266 Wifi Serial Bridge"
-
-// used to prevent loading incompatible settings struct
+// used to prevent loading incompatible settings from EEPROM
 const uint16_t VERSION = 3;
 
+// default settings
 typedef struct {
     uint8_t channel = 7;
     char ssid[32] = "ESP8266 Serial";
@@ -125,101 +126,7 @@ void setup() {
     delay(500);
 }
 
-// TODO temp
-void do_menu();
-
-void loop() {
-    // each new client just drops the old one
-    if (server_setup.hasClient()) {
-        if (client) {
-            client.stop();
-        }
-
-        client = server_setup.accept();
-        is_setup = true;
-
-        client.println(NAME " Setup");
-        swSerial.println("New setup client connected");
-
-        menu_index = MENU_START_PRINT;
-    }
-
-    if (server_serial.hasClient()) {
-        if (client) {
-            client.stop();
-        }
-
-        client = server_serial.accept();
-        is_setup = false;
-
-        client.println(NAME);
-        swSerial.println("New serial client connected");
-    }
-
-    // there is nothing to do without a client
-    if (!client) {
-        return;
-    }
-
-    if (is_setup) {
-        do_menu();
-    } else {
-        // NOTE: this is a simpler version of the below code
-        /*
-        // if there is any data from client send it to the serial
-        if (client.available() > 0 && Serial.availableForWrite() > 0) {
-            client.sendAvailable(Serial);
-        }
-
-        // if there is any data from serial send it to the client
-        if (Serial.available() > 0 && client.availableForWrite() > 0) {
-            Serial.sendAvailable(client);
-        }
-        */
-
-        // more complex code
-        while (client.available() > 0 && Serial.availableForWrite() > 0) {
-            Serial.write(client.read());
-        }
-
-        // determine maximum output size "fair TCP use"
-        // client.availableForWrite() returns 0 when !client.connected()
-        int maxToTcp = 0;
-        if (client) {
-            int afw = client.availableForWrite();
-            if (afw) {
-                if (!maxToTcp) {
-                    maxToTcp = afw;
-                } else {
-                    maxToTcp = std::min(maxToTcp, afw);
-                }
-            } else {
-                // warn but ignore congested clients
-                swSerial.println("Client is congested");
-            }
-        }
-
-        // check UART for data
-        size_t len = std::min(Serial.available(), maxToTcp);
-        len = std::min(len, (size_t)STACK_PROTECTOR);
-        if (len) {
-            uint8_t sbuf[len];
-            int serial_got = Serial.readBytes(sbuf, len);
-            // push UART data to all connected telnet clients
-            // if client.availableForWrite() was 0 (congested)
-            // and increased since then,
-            // ensure write space is sufficient:
-            if (client.availableForWrite() >= serial_got) {
-                size_t tcp_sent = client.write(sbuf, serial_got);
-                if (tcp_sent != len) {
-                    swSerial.printf("len mismatch: available:%zd serial-read:%zd tcp-write:%zd\r\n", len, serial_got, tcp_sent);
-                }
-            }
-        }
-    }
-}
-
-void do_menu() {
+void menu() {
     String response;
     bool hasResponded = false;
 
@@ -458,3 +365,96 @@ void do_menu() {
             break;
     }
 }
+
+void loop() {
+    // each new client just drops the old one
+    if (server_setup.hasClient()) {
+        if (client) {
+            client.stop();
+        }
+
+        client = server_setup.accept();
+        is_setup = true;
+
+        client.println(NAME " Setup");
+        swSerial.println("New setup client connected");
+
+        menu_index = MENU_START_PRINT;
+    }
+
+    if (server_serial.hasClient()) {
+        if (client) {
+            client.stop();
+        }
+
+        client = server_serial.accept();
+        is_setup = false;
+
+        client.println(NAME);
+        swSerial.println("New serial client connected");
+    }
+
+    // there is nothing to do without a client
+    if (!client) {
+        return;
+    }
+
+    if (is_setup) {
+        menu();
+    } else {
+        // NOTE: this is a simpler version of the below code
+        /*
+        // if there is any data from client send it to the serial
+        if (client.available() > 0 && Serial.availableForWrite() > 0) {
+            client.sendAvailable(Serial);
+        }
+
+        // if there is any data from serial send it to the client
+        if (Serial.available() > 0 && client.availableForWrite() > 0) {
+            Serial.sendAvailable(client);
+        }
+        */
+
+        // more complex code
+        while (client.available() > 0 && Serial.availableForWrite() > 0) {
+            Serial.write(client.read());
+        }
+
+        // determine maximum output size "fair TCP use"
+        // client.availableForWrite() returns 0 when !client.connected()
+        int maxToTcp = 0;
+        if (client) {
+            int afw = client.availableForWrite();
+            if (afw) {
+                if (!maxToTcp) {
+                    maxToTcp = afw;
+                } else {
+                    maxToTcp = std::min(maxToTcp, afw);
+                }
+            } else {
+                // warn but ignore congested clients
+                swSerial.println("Client is congested");
+            }
+        }
+
+        // check UART for data
+        size_t len = std::min(Serial.available(), maxToTcp);
+        len = std::min(len, (size_t)STACK_PROTECTOR);
+        if (len) {
+            uint8_t sbuf[len];
+            int serial_got = Serial.readBytes(sbuf, len);
+            // push UART data to all connected telnet clients
+            // if client.availableForWrite() was 0 (congested)
+            // and increased since then,
+            // ensure write space is sufficient:
+            if (client.availableForWrite() >= serial_got) {
+                size_t tcp_sent = client.write(sbuf, serial_got);
+                if (tcp_sent != len) {
+                    swSerial.printf("len mismatch: available:%zd serial-read:%zd tcp-write:%zd\r\n", len, serial_got, tcp_sent);
+                }
+            }
+        }
+    }
+}
+
+
